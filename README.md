@@ -132,3 +132,7 @@ Sources/Docklet/
 ## 说明
 
 `copilot_internal/user` 是 GitHub 官方编辑器插件使用的接口，非公开 API，返回结构可能变动。Docklet 对缺失字段做了容错，字段变更时会退化显示而不是崩溃。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 Cance1ed
