@@ -29,6 +29,9 @@ final class PanelController {
     /// animation is followed all the way to rest instead of stepping at the idle timer's rate.
     private let settleDuration: CFTimeInterval = 0.9
     private var lastGeometryChange: CFTimeInterval = 0
+    /// How long the Dock may stay enlarged and motionless before that size is taken as its new
+    /// resting size. Far longer than anyone keeps a Dock menu open.
+    private let restAdoptionDelay: CFTimeInterval = 30
     private var mouseMonitor: Any?
     /// Cached so the panel's appearance is only reassigned when it genuinely changes.
     private var appliedStyle: WidgetContentView.Style?
@@ -40,11 +43,11 @@ final class PanelController {
     var onOpenMenu: (() -> Void)?
     private(set) var isEmbedded = false
     private var lastPaintedSize: NSSize = .zero
-    private var restingSlot: (rect: NSRect, tileSize: CGSize)?
-    private var prediction: (start: CFTimeInterval, from: NSRect)?
-    private var pointerWasInsideDock = false
-    private var isMenuOpen = false
-    private var maxSlotDepth: CGFloat = 0
+    /// How far the slot reaches out from the screen edge now, and the least it has reached since
+    /// the Dock was last rebuilt. Magnification only ever grows tiles, so the minimum is the
+    /// resting size and anything above it means the Dock is magnified.
+    private var slotDepth: CGFloat = 0
+    private var restDepth: CGFloat?
     /// Where the embedded slot's Dock sits and on which screen, so pointer proximity can be judged
     /// against the whole Dock strip rather than just the tiles.
     private var embeddedEdge: DockFrame.Edge = .bottom
@@ -139,22 +142,14 @@ final class PanelController {
     /// Forces a full rediscovery — used after the Dock restarts.
     func invalidateDockCache() {
         tracker.invalidate()
-        restingSlot = nil
-        prediction = nil
-        maxSlotDepth = 0
+        restDepth = nil
         reposition()
     }
 
     func presentMenu(_ menu: NSMenu) {
         let point = NSPoint(x: panel.frame.width / 2, y: panel.frame.height + 4)
-        // The Dock stays magnified for as long as the menu is open, even with the pointer up in
-        // the menu, so leaving the Dock must not be read as the Dock about to shrink back.
-        isMenuOpen = true
-        prediction = nil
         menu.popUp(positioning: nil, at: point, in: stack)
-        isMenuOpen = false
-        pointerWasInsideDock = false
-        lastGeometryChange = CACurrentMediaTime()
+        // Follow the Dock as it shrinks back now that the menu no longer holds it magnified.
         startDisplayLink()
     }
 
@@ -297,17 +292,27 @@ final class PanelController {
         }
     }
 
-    /// Frame-rate tracking stays on while the pointer is near the Dock *and* for a short settle
-    /// window after the geometry last changed. Stopping the moment the pointer leaves made the
-    /// Dock's un-magnify animation play back in visible 0.6s steps.
+    /// Frame-rate tracking stays on while the pointer is near the Dock, while the Dock is
+    /// magnified, and for a short settle window after the geometry last changed. Stopping the
+    /// moment the pointer leaves made the Dock's un-magnify animation play back in visible 0.6s
+    /// steps.
     private var shouldTrackAtFrameRate: Bool {
         guard isEmbedded else { return false }
-        if prediction != nil { return true }
+        if isDockMagnified { return true }
         // While the popover is open the pointer often sits away from the Dock, but the tiles must
         // still track it so opening or closing the panel never leaves them behind.
         if popover.isShown { return true }
         if CACurrentMediaTime() - lastGeometryChange < settleDuration { return true }
         return isPointerOverDockStrip
+    }
+
+    /// A context menu — the Dock's own or Docklet's — holds the Dock magnified however far away
+    /// the pointer wanders, and the Dock shrinks back the moment the menu closes. Tracking for as
+    /// long as it is magnified means that shrink is followed frame by frame, not caught by the
+    /// idle timer up to 0.6s late.
+    private var isDockMagnified: Bool {
+        guard let restDepth else { return false }
+        return slotDepth > restDepth + 0.5
     }
 
     /// Magnifying icons anywhere along the Dock pushes the slot sideways even when the pointer is
@@ -332,9 +337,9 @@ final class PanelController {
             isEmbedded = true
             embeddedEdge = slot.edge
             embeddedScreenFrame = slot.screen.frame
+            updateDepth(of: slot)
             guard ensureVisible(dockRect: slot.rect, edge: slot.edge, screen: slot.screen) else { return }
-            let target = predictedFrame(for: slot) ?? (slot.rect, slot.tileSize)
-            apply(frame: target.rect, style: .embedded, edge: slot.edge, tileSize: target.tileSize)
+            apply(frame: slot.rect, style: .embedded, edge: slot.edge, tileSize: slot.tileSize)
             return
         }
 
@@ -402,68 +407,24 @@ final class PanelController {
         }
     }
 
-    // MARK: - Un-magnify prediction
+    // MARK: - Magnification
 
-    /// After a click the Dock's accessibility geometry trails what it draws by up to ~200ms, so
-    /// following it alone left the tiles parked at their magnified position after the Dock had
-    /// already shrunk back, then jumping. The Dock always settles at its resting layout once the
-    /// pointer leaves it, so that exit is anticipated: the tiles glide to the remembered resting
-    /// slot in step with the Dock and resume following the reported geometry once it agrees.
-    private func predictedFrame(for slot: DockSlot) -> (rect: NSRect, tileSize: CGSize)? {
-        let now = CACurrentMediaTime()
-        let pointer = NSEvent.mouseLocation
+    private func updateDepth(of slot: DockSlot) {
         let depth = extent(of: slot.rect, along: slot.edge)
-        maxSlotDepth = max(maxSlotDepth, depth)
-
-        // Resting geometry is only trustworthy when the pointer is well clear of the Dock and
-        // nothing has moved for a while — magnification anywhere along the Dock shifts the slot.
-        if !isPointerOverDockStrip, now - lastGeometryChange > 0.3, prediction == nil {
-            restingSlot = (slot.rect, slot.tileSize)
+        slotDepth = depth
+        let now = CACurrentMediaTime()
+        if let rest = restDepth, depth > rest + 0.5, now - lastGeometryChange > restAdoptionDelay {
+            // Bigger for this long with nothing moving means the Dock size setting grew rather
+            // than a menu holding it magnified, so stop polling the Dock at display rate.
+            restDepth = depth
+        } else {
+            restDepth = min(restDepth ?? depth, depth)
         }
-
-        let outside = distanceBeyondDock(pointer, slot: slot) > 1
-        defer { pointerWasInsideDock = !outside }
-
-        if prediction == nil, !isMenuOpen, outside, pointerWasInsideDock, let rest = restingSlot,
-           depth > extent(of: rest.rect, along: slot.edge) + 3 {
-            prediction = (start: now, from: panel.frame)
-            Trace.log("PREDICT un-magnify -> \(rest.rect)")
-        }
-
-        guard let active = prediction, let rest = restingSlot else { return nil }
-        let reportedAtRest = abs(depth - extent(of: rest.rect, along: slot.edge)) < 1
-        if !outside || reportedAtRest || now - active.start > 0.6 {
-            prediction = nil
-            return nil
-        }
-
-        // Matches the Dock's own short un-magnify, eased out so it lands softly.
-        let t = min(1, (now - active.start) / 0.09)
-        let eased = 1 - pow(1 - t, 3)
-        let from = active.from
-        let rect = NSRect(
-            x: from.minX + (rest.rect.minX - from.minX) * eased,
-            y: from.minY + (rest.rect.minY - from.minY) * eased,
-            width: from.width + (rest.rect.width - from.width) * eased,
-            height: from.height + (rest.rect.height - from.height) * eased
-        )
-        let scale = rect.width / max(rest.rect.width, 1)
-        let tile = CGSize(width: rest.tileSize.width * scale, height: rest.tileSize.height * scale)
-        return (rect, tile)
     }
 
     /// How far a slot reaches out from the screen edge, which is what magnification grows.
     private func extent(of rect: NSRect, along edge: DockFrame.Edge) -> CGFloat {
         edge == .bottom ? rect.height : rect.width
-    }
-
-    /// Positive once the pointer is past the outer edge of the fully magnified Dock.
-    private func distanceBeyondDock(_ pointer: NSPoint, slot: DockSlot) -> CGFloat {
-        switch slot.edge {
-        case .bottom: return pointer.y - (slot.rect.minY + maxSlotDepth)
-        case .left: return pointer.x - (slot.rect.minX + maxSlotDepth)
-        case .right: return (slot.rect.maxX - maxSlotDepth) - pointer.x
-        }
     }
 
     /// Hides the panel while the Dock is slid off-screen by auto-hide; returns false when hidden.
